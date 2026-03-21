@@ -31,6 +31,16 @@ from pathlib import Path
 
 import numpy as np
 
+# ─── Load .env file if present ────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    _env = Path(__file__).parent / ".env"
+    if _env.exists():
+        load_dotenv(_env)
+        print(f"  Loaded environment from {_env}")
+except ImportError:
+    pass  # python-dotenv not installed — real env vars still work fine
+
 # ─── Lazy imports with helpful error messages ──────────────────────────────────
 
 def require(pkg, pip_name=None):
