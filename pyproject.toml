@@ -1,0 +1,11 @@
+[project]
+name = "stravaroutevisualizer"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.3",
+    "python-dotenv>=1.2.2",
+    "rasterio>=1.5.0",
+    "requests>=2.32.5",
+    "scipy>=1.17.1",
+]
