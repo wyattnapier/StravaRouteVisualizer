@@ -284,210 +284,100 @@ def _triangles_to_xml_mesh(triangles, obj_id):
         f'    </object>'
     )
 
-
-def write_3mf(terrain_tris, route_tris, output_path):
-    # pack all 3 meshes into a .3mf with extruder assignments
-    # baseplate + terrain = extruder 1, route = extruder 2
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
-        '  <Default Extension="rels" ContentType='
-        '"application/vnd.openxmlformats-package.relationships+xml" />\n'
-        '  <Default Extension="model" ContentType='
-        '"application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />\n'
-        '</Types>'
-    )
-
-    rels = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
-        '  <Relationship Target="/3D/3dmodel.model" Id="rel0" Type='
-        '"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />\n'
-        '</Relationships>'
-    )
-    obj2 = _triangles_to_xml_mesh(terrain_tris, 2)
-    obj3 = _triangles_to_xml_mesh(route_tris, 3)
-
-    model = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<model unit="millimeter" xml:lang="en-US"\n'
-        '  xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
-        '  <resources>\n'
-        + obj2 + "\n"
-        + obj3 + "\n"
-        '  </resources>\n'
-        '  <build>\n'
-        '    <item objectid="2" />\n'
-        '    <item objectid="3" />\n'
-        '  </build>\n'
-        '</model>'
-    )
-
-    model_settings = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<config>\n'
-        '  <object id="2">\n'
-        '    <metadata key="name" value="terrain" />\n'
-        '    <metadata key="extruder" value="1" />\n'
-        '  </object>\n'
-        '  <object id="3">\n'
-        '    <metadata key="name" value="route" />\n'
-        '    <metadata key="extruder" value="2" />\n'
-        '  </object>\n'
-        '</config>'
-    )
-
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", rels)
-        zf.writestr("3D/3dmodel.model", model)
-        zf.writestr("Metadata/model_settings.config", model_settings)
-
-    size_kb = output_path.stat().st_size // 1024
-    print(f"3MF saved: {output_path}  ({size_kb} KB)")
-
-
-def build_baseplate(width_mm, depth_mm, base_thickness_mm):
-    W, D, H = width_mm, depth_mm, base_thickness_mm
-    tris = []
-    tris += [[[0,0,0],[W,0,0],[W,D,0]],        # bottom
-             [[0,0,0],[W,D,0],[0,D,0]]]
-    tris += [[[0,0,H],[W,D,H],[W,0,H]],        # top
-             [[0,0,H],[0,D,H],[W,D,H]]]
-    tris += [[[0,0,0],[W,0,H],[W,0,0]],        # front
-             [[0,0,0],[0,0,H],[W,0,H]]]
-    tris += [[[0,D,0],[W,D,0],[W,D,H]],        # back
-             [[0,D,0],[W,D,H],[0,D,H]]]
-    tris += [[[0,0,0],[0,D,0],[0,D,H]],        # left
-             [[0,0,0],[0,D,H],[0,0,H]]]
-    tris += [[[W,0,0],[W,D,H],[W,D,0]],        # right
-             [[W,0,0],[W,0,H],[W,D,H]]]
-    return np.array(tris, dtype=np.float32)
-
-def weld_vertices(tris, tol=1e-3):
-    verts = tris.reshape(-1,3)
-
+def weld_vertices(tris, tol=1e-4):
+    """Standardizes vertices to ensure manifold edges by merging nearly identical points."""
+    verts = tris.reshape(-1, 3)
+    # Rounding to tolerance prevents micro-gaps that slicers hate
     quant = np.round(verts / tol)
     uniq, inverse = np.unique(quant, axis=0, return_inverse=True)
-
     welded = uniq * tol
-    tris_welded = welded[inverse].reshape(-1,3,3)
-
-    return tris_welded.astype(np.float32)
+    return welded[inverse].reshape(-1, 3, 3).astype(np.float32)
 
 def build_terrain(lon2d, lat2d, elev_grid,
                   lat_min, lat_max, lon_min, lon_max,
                   width_mm, depth_mm,
                   elev_min, elev_max,
                   base_thickness_mm, terrain_height_mm):
+    """
+    Builds a watertight terrain block with zero non-manifold edges.
 
-    n = elev_grid.shape[0]
+    The two root causes of non-manifold edges this fixes:
 
-    x2d, y2d = geo_to_mm(
-        lat2d, lon2d,
-        lat_min, lat_max, lon_min, lon_max,
-        width_mm, depth_mm
-    )
+    1. Border vertex snapping:
+       geo_to_mm uses floating-point division so the border pixels of x2d/y2d
+       may not land exactly on 0 or width_mm/depth_mm.  Any epsilon gap between
+       wall bottom vertices and the floor creates T-junctions (non-manifold).
+       Fix: explicitly snap x2d[:,0]=0, x2d[:,-1]=width_mm, etc.
 
-    z2d = elev_to_mm(
-        elev_grid,
-        elev_min, elev_max,
-        terrain_height_mm,
-        base_thickness_mm
-    )
+    2. Floor as a triangle fan over border vertices:
+       A 2-triangle floor quad has only 4 perimeter edges, but the 4 walls
+       each consist of N-1 quads whose bottom edges together form the same
+       perimeter.  Those N-1 bottom edges cannot be shared with a 4-edge floor.
+       Fix: build the floor as a fan of triangles from the centroid, using the
+       same border vertices walked in order, so every floor edge is exactly
+       shared with one wall quad.
+    """
+    nrows, ncols = elev_grid.shape
 
-    z_bot = base_thickness_mm
+    x2d, y2d = geo_to_mm(lat2d, lon2d, lat_min, lat_max, lon_min, lon_max, width_mm, depth_mm)
+    z2d = elev_to_mm(elev_grid, elev_min, elev_max, terrain_height_mm, base_thickness_mm)
 
+    # Snap border rows/cols to exact boundary values
+    x2d[:, 0]  = 0.0;       x2d[:, -1] = width_mm
+    y2d[0, :]  = 0.0;       y2d[-1, :] = depth_mm
+
+    z_floor = 0.0
     tris = []
 
-    # -----------------------------
-    # Top surface
-    # -----------------------------
+    # 1. TOP SURFACE
+    for i in range(nrows - 1):
+        for j in range(ncols - 1):
+            v00 = [x2d[i,   j],   y2d[i,   j],   z2d[i,   j]]
+            v10 = [x2d[i+1, j],   y2d[i+1, j],   z2d[i+1, j]]
+            v01 = [x2d[i,   j+1], y2d[i,   j+1], z2d[i,   j+1]]
+            v11 = [x2d[i+1, j+1], y2d[i+1, j+1], z2d[i+1, j+1]]
+            tris.append([v00, v10, v11])
+            tris.append([v00, v11, v01])
 
-    for i in range(n-1):
-        for j in range(n-1):
+    # 2. BOTTOM FACE — triangle fan from centroid over border vertices
+    # Walk all border positions in CCW order (viewed from below, normal = -Z).
+    cx, cy = width_mm / 2.0, depth_mm / 2.0
+    center = [cx, cy, z_floor]
+    border = []
+    for j in range(ncols):           border.append([x2d[0,      j],      y2d[0,      j],      z_floor])
+    for i in range(1, nrows):        border.append([x2d[i,      ncols-1],y2d[i,      ncols-1],z_floor])
+    for j in range(ncols-2, -1, -1): border.append([x2d[nrows-1,j],      y2d[nrows-1,j],      z_floor])
+    for i in range(nrows-2,  0, -1): border.append([x2d[i,      0],      y2d[i,      0],      z_floor])
+    nb = len(border)
+    for k in range(nb):
+        tris.append([center, border[(k+1) % nb], border[k]])  # CW → normal -Z
 
-            v00 = [x2d[i,j], y2d[i,j], z2d[i,j]]
-            v10 = [x2d[i+1,j], y2d[i+1,j], z2d[i+1,j]]
-            v01 = [x2d[i,j+1], y2d[i,j+1], z2d[i,j+1]]
-            v11 = [x2d[i+1,j+1], y2d[i+1,j+1], z2d[i+1,j+1]]
+    # 3. SIDE WALLS
+    # Front (i=0) and Back (i=nrows-1)
+    for j in range(ncols - 1):
+        for i, flip in [(0, False), (nrows - 1, True)]:
+            t0 = [x2d[i, j],   y2d[i, j],   z2d[i, j]]
+            t1 = [x2d[i, j+1], y2d[i, j+1], z2d[i, j+1]]
+            b0 = [x2d[i, j],   y2d[i, j],   z_floor]
+            b1 = [x2d[i, j+1], y2d[i, j+1], z_floor]
+            if flip:
+                tris.append([t0, b0, b1]); tris.append([t0, b1, t1])
+            else:
+                tris.append([t0, b1, b0]); tris.append([t0, t1, b1])
 
-            tris.append([v00,v10,v11])
-            tris.append([v00,v11,v01])
+    # Left (j=0) and Right (j=ncols-1)
+    for i in range(nrows - 1):
+        for j, flip in [(0, False), (ncols - 1, True)]:
+            t0 = [x2d[i,   j], y2d[i,   j], z2d[i,   j]]
+            t1 = [x2d[i+1, j], y2d[i+1, j], z2d[i+1, j]]
+            b0 = [x2d[i,   j], y2d[i,   j], z_floor]
+            b1 = [x2d[i+1, j], y2d[i+1, j], z_floor]
+            if flip:
+                tris.append([t0, b0, b1]); tris.append([t0, b1, t1])
+            else:
+                tris.append([t0, b1, b0]); tris.append([t0, t1, b1])
 
-    # -----------------------------
-    # Bottom
-    # -----------------------------
-
-    for i in range(n-1):
-        for j in range(n-1):
-
-            v00 = [x2d[i,j], y2d[i,j], z_bot]
-            v10 = [x2d[i+1,j], y2d[i+1,j], z_bot]
-            v01 = [x2d[i,j+1], y2d[i,j+1], z_bot]
-            v11 = [x2d[i+1,j+1], y2d[i+1,j+1], z_bot]
-
-            tris.append([v00,v11,v10])
-            tris.append([v00,v01,v11])
-
-    # -----------------------------
-    # Walls
-    # -----------------------------
-
-    # front
-    i = n-1
-    for j in range(n-1):
-
-        t0=[x2d[i,j],y2d[i,j],z2d[i,j]]
-        t1=[x2d[i,j+1],y2d[i,j+1],z2d[i,j+1]]
-
-        b0=[x2d[i,j],y2d[i,j],z_bot]
-        b1=[x2d[i,j+1],y2d[i,j+1],z_bot]
-
-        tris.append([t0,b0,b1])
-        tris.append([t0,b1,t1])
-
-    # back
-    i = 0
-    for j in range(n-1):
-
-        t0=[x2d[i,j],y2d[i,j],z2d[i,j]]
-        t1=[x2d[i,j+1],y2d[i,j+1],z2d[i,j+1]]
-
-        b0=[x2d[i,j],y2d[i,j],z_bot]
-        b1=[x2d[i,j+1],y2d[i,j+1],z_bot]
-
-        tris.append([t0,b1,b0])
-        tris.append([t0,t1,b1])
-
-    # left
-    j = 0
-    for i in range(n-1):
-
-        t0=[x2d[i,j],y2d[i,j],z2d[i,j]]
-        t1=[x2d[i+1,j],y2d[i+1,j],z2d[i+1,j]]
-
-        b0=[x2d[i,j],y2d[i,j],z_bot]
-        b1=[x2d[i+1,j],y2d[i+1,j],z_bot]
-
-        tris.append([t0,b1,b0])
-        tris.append([t0,t1,b1])
-
-    # right
-    j = n-1
-    for i in range(n-1):
-
-        t0=[x2d[i,j],y2d[i,j],z2d[i,j]]
-        t1=[x2d[i+1,j],y2d[i+1,j],z2d[i+1,j]]
-
-        b0=[x2d[i,j],y2d[i,j],z_bot]
-        b1=[x2d[i+1,j],y2d[i+1,j],z_bot]
-
-        tris.append([t0,b0,b1])
-        tris.append([t0,b1,t1])
-
-    raw = np.array(tris, dtype=np.float32)
-    return weld_vertices(raw)
+    return weld_vertices(np.array(tris, dtype=np.float32))
 
 
 def build_route(route_x, route_y, route_z_terrain,
@@ -605,6 +495,12 @@ def parse_args():
     p.add_argument("--opentopo-key", default=os.environ.get("OPENTOPO_API_KEY"),
                    help="OpenTopography API key")
     p.add_argument("--no-3mf", action="store_true", help="skip .3mf generation")
+    p.add_argument("--z-exaggeration", type=float, default=1.0,
+                   help="Vertical exaggeration multiplier (e.g. 2.0 = double the relief). "
+                        "Applied after normalization. Useful when terrain is nearly flat.")
+    p.add_argument("--z-percentile", type=float, default=None,
+                   help="Clip elevation range to this percentile (e.g. 2 clips bottom/top 2%%). "
+                        "Helps when a few extreme outliers in the DEM flatten everything else.")
     return p.parse_args()
 
 
@@ -667,8 +563,33 @@ def main():
         print(f"  Route elevation from DEM: "
               f"[{alts.min():.0f}-{alts.max():.0f}] m")
 
-    elev_min = min(elev_grid.min(), alts.min())
-    elev_max = max(elev_grid.max(), alts.max())
+    # --- Elevation range for Z scaling ---
+    # Use percentile clipping if requested, to avoid outlier peaks/valleys
+    # in the DEM collapsing the interesting terrain into a thin sliver.
+    all_elevs = np.concatenate([elev_grid.ravel(), alts])
+    if args.z_percentile is not None:
+        p_lo = args.z_percentile
+        p_hi = 100.0 - args.z_percentile
+        elev_min = float(np.percentile(all_elevs, p_lo))
+        elev_max = float(np.percentile(all_elevs, p_hi))
+        print(f"  Elevation range (p{p_lo:.0f}-p{p_hi:.0f}): "
+              f"{elev_min:.0f}–{elev_max:.0f} m  (raw: {all_elevs.min():.0f}–{all_elevs.max():.0f} m)")
+    else:
+        elev_min = float(all_elevs.min())
+        elev_max = float(all_elevs.max())
+        print(f"  Elevation range: {elev_min:.0f}–{elev_max:.0f} m  "
+              f"(relief = {elev_max - elev_min:.0f} m → {args.terrain_mm:.0f} mm print height)")
+        if (elev_max - elev_min) < 50:
+            print("  ⚠  Very low relief! Try --z-exaggeration 3 or --z-percentile 2")
+
+    # Apply vertical exaggeration by shrinking the effective range
+    if args.z_exaggeration != 1.0:
+        mid = (elev_min + elev_max) / 2.0
+        half = (elev_max - elev_min) / 2.0 / args.z_exaggeration
+        elev_min = mid - half
+        elev_max = mid + half
+        print(f"  After {args.z_exaggeration}x exaggeration: "
+              f"effective range {elev_min:.0f}–{elev_max:.0f} m")
 
     lat_min_t = lat2d.min()
     lat_max_t = lat2d.max()
@@ -715,25 +636,10 @@ def main():
         args.base_mm, args.terrain_mm,
     )
 
-    print("  building route...")
-    route_tris = build_route(
-        route_x, route_y, route_z_terrain,
-        args.route_raise_mm, args.route_width_mm
-    )
-
     print("\n[6/6] Writing STL files ...")
-    write_binary_stl(terrain_tris, out_dir / "terrain.stl")
-    write_binary_stl(route_tris,   out_dir / "route.stl")
-
-    if not args.no_3mf:
-        write_3mf(terrain_tris, route_tris,
-                  out_dir / "output.3mf")
+    write_binary_stl(terrain_tris, out_dir / "terrain_only.stl")
 
     print(f"\ndone! files in {out_dir}/")
-    print(f"  baseplate.stl + terrain.stl = extruder 1 (base color)")
-    print(f"  route.stl = extruder 2 (accent color)")
-    if not args.no_3mf:
-        print(f"  output.3mf = ready for Bambu Studio")
     print(f"  model size: {args.width_mm:.0f}x{args.depth_mm:.0f}x"
           f"{args.base_mm+args.terrain_mm+args.route_raise_mm:.0f}mm")
 
