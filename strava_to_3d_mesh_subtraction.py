@@ -78,24 +78,46 @@ def strava_get_streams(activity_id, token):
 
 
 def strava_get_latest_activity_id(token):
-    # grab the most recent activity that actually has GPS data
+    # grab the most recent activities and let the user choose one with GPS data
     url = f"{STRAVA_API_BASE}/athlete/activities"
     resp = requests.get(url, headers={"Authorization": f"Bearer {token}"},
-                        params={"per_page": 10, "page": 1})
+                        params={"per_page": 25, "page": 1})
     resp.raise_for_status()
     activities = resp.json()
+
     if not activities:
         raise ValueError("No activities found on this Strava account.")
-    for act in activities:
-        if act.get("map", {}).get("summary_polyline"):
-            print(f"Most recent GPS activity: '{act['name']}' "
-                  f"(ID {act['id']}, {act.get('type','?')}, "
-                  f"{act.get('distance', 0)/1000:.1f} km)")
-            return act["id"]
-    raise ValueError(
-        "None of your 10 most recent activities have GPS data. "
-        "Specify --activity-id explicitly."
-    )
+
+    gps_activities = [
+        act for act in activities
+        if act.get("map", {}).get("summary_polyline")
+    ]
+
+    if not gps_activities:
+        raise ValueError(
+            "None of your 10 most recent activities have GPS data. "
+            "Specify --activity-id explicitly."
+        )
+
+    print("\nMost recent activities with GPS data:\n")
+
+    for i, act in enumerate(gps_activities, 1):
+        name = act.get("name", "Unnamed")
+        typ = act.get("type", "?")
+        dist_km = act.get("distance", 0) / 1000
+        print(f"{i}. {name} ({typ}, {dist_km:.1f} km) [ID {act['id']}]")
+
+    while True:
+        try:
+            choice = int(input("\nSelect activity number: "))
+            if 1 <= choice <= len(gps_activities):
+                selected = gps_activities[choice - 1]
+                print(f"\nSelected: '{selected['name']}' (ID {selected['id']})")
+                return selected["id"]
+        except ValueError:
+            pass
+
+        print("Invalid selection. Try again.")
 
 
 def extract_route_coords(streams):
@@ -505,7 +527,7 @@ def carve_trench_into_grid(elev_grid, x2d, y2d,
     A small clearance (10 % of route width) is added so the trench is
     fractionally wider than the ribbon, giving a snug but printable fit.
     """
-    clearance = route_width_mm * 0.10
+    clearance = route_width_mm * 0.30
     half_w    = route_width_mm / 2.0 + clearance
 
     n_pts = len(route_x)
